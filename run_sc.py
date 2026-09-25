@@ -19,8 +19,6 @@ from __future__ import absolute_import, division, print_function
 由于数据集中，没有关于NONE的数据，所以在最后的结果中，对于NONE的分类一定是很差的，可以考虑数据增强(为每个样本创建1-2个错误三元组)，来增加NONE数据的数量
 '''
 
-import nltk
-from nltk.tokenize import word_tokenize
 import argparse
 import glob
 import logging
@@ -54,7 +52,6 @@ from transformers import (WEIGHTS_NAME, BertConfig,
                                   AlbertForACEBothOneDropoutSub,
                                   BertForACEBothOneDropoutSubNoNer,
                                   )
-import spacy
 from transformers import AutoTokenizer
 from torch.utils.data import TensorDataset, Dataset
 import json
@@ -63,7 +60,7 @@ import numpy as np
 import unicodedata
 import itertools
 import timeit
-from allennlp.modules.token_embedders.embedding import Embedding
+from torch.nn import Embedding
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
@@ -1755,7 +1752,7 @@ def main():
 
 
 if __name__ == "__main__":
-    os.environ["WANDB_API_KEY"] = 'fd6485f6c00464e97c16eb1243fdd48710f7fd93'  # 将引号内的+替换成自己在wandb上的一串值
+    os.environ["WANDB_MODE"] = "disabled"
     #os.environ["WANDB_MODE"] = "offline"  # 离线  （此行代码不用修改）
     # os.environ['WANDB_TIMEOUT'] = '300'
     main()

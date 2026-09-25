@@ -34,7 +34,7 @@ from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
 from torch.utils.data.distributed import DistributedSampler
 from tensorboardX import SummaryWriter
 from tqdm import tqdm, trange
-from allennlp.modules.token_embedders.embedding import Embedding
+from torch.nn import Embedding
 from transformers import (WEIGHTS_NAME, BertConfig,
                           BertTokenizer,
                           RobertaConfig,
@@ -126,7 +126,7 @@ class ACEDatasetNER(Dataset):
         self.max_entity_length = args.max_pair_length * 2
 
         # ====new=====
-        from allennlp.modules.token_embedders.embedding import Embedding
+        from torch.nn import Embedding
         self._span_width_embedding = Embedding(
             num_embeddings=args.num_width_embeddings, embedding_dim=args.span_width_embedding_dim
         )
