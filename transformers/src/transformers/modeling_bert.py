@@ -2385,7 +2385,17 @@ class BertForACEBothOneDropoutSub(BertPreTrainedModel):
             self.re_classifier_m2 = nn.Linear(config.hidden_size * 2,self.num_labels).float()
         self.alpha = torch.tensor([config.alpha] + [1.0] * (self.num_labels - 1), dtype=torch.float32)
 
+        self.use_lexicon = getattr(args, 'use_lexicon', False)
+        if self.use_lexicon:
+            lex_dim = getattr(args, 'lex_emb_dim', 32)
+            self.lex_emb = nn.Embedding(6, lex_dim)
+            self.lex_proj = nn.Linear(lex_dim, config.hidden_size)
+
         self.init_weights()
+
+        if self.use_lexicon:
+            nn.init.zeros_(self.lex_proj.weight)
+            nn.init.zeros_(self.lex_proj.bias)
 
         self.norm_gcn = nn.LayerNorm(args.embedding_dim).double()
 
@@ -2409,6 +2419,7 @@ class BertForACEBothOneDropoutSub(BertPreTrainedModel):
             adj=None,
             sub_width_embedding=None,
             obj_width_embedding=None,
+            lex_ids=None,
     ):
 
         outputs = self.bert(
@@ -2423,6 +2434,9 @@ class BertForACEBothOneDropoutSub(BertPreTrainedModel):
         hidden_states = outputs[0]
         pool_out = outputs[1]
 
+        if self.use_lexicon and lex_ids is not None:
+            lex_repr = self.lex_proj(self.lex_emb(lex_ids))
+            hidden_states = hidden_states + lex_repr
 
         if self.args.gcn:
             dep_sparse_out_previous = hidden_states

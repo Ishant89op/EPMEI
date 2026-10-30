@@ -140,6 +140,13 @@ class ACEDataset(Dataset):
 
         self.evaluate = evaluate
         self.use_typemarker = args.use_typemarker
+        self.align_markers = getattr(args, 'align_markers', False)
+        self.use_lexicon = getattr(args, 'use_lexicon', False)
+        self.lexicon = None
+        if self.use_lexicon:
+            from lexicon import SentimentLexicon
+            lex_dir = getattr(args, 'lexicon_dir', 'lexicon')
+            self.lexicon = SentimentLexicon(lex_dir)
         self.local_rank = args.local_rank
         self.args = args
         self.model_type = args.model_type
@@ -441,6 +448,7 @@ class ACEDataset(Dataset):
                             'whole_sen':whole_sent,
                             'sen_word':sen_word,
                             'origion_adj': data['graph'],
+                            'lex_features': self.lexicon.build_features(sen_word) if (self.use_lexicon and self.lexicon) else None,
                         }
 
                         self.data.append(item)
@@ -499,11 +507,36 @@ class ACEDataset(Dataset):
                 except:
                     tok_adj[i][j] = ori_adj[tok2ori_map_t[i]][tok2ori_map_t[j]]
 
+        if getattr(self.args, 'align_markers', False):
+            marker_positions = [i for i in range(truncate_tok_len) if tok2ori_map_t[i] == -1]
+            if len(marker_positions) == 2:
+                start_marker_pos = marker_positions[0]
+                end_marker_pos = marker_positions[1]
+                span_first = start_marker_pos + 1
+                if span_first < truncate_tok_len and tok2ori_map_t[span_first] != -1:
+                    tok_adj[start_marker_pos][span_first] = 1
+                    tok_adj[span_first][start_marker_pos] = 1
+                span_last = end_marker_pos - 1
+                if span_last >= 0 and tok2ori_map_t[span_last] != -1:
+                    tok_adj[end_marker_pos][span_last] = 1
+                    tok_adj[span_last][end_marker_pos] = 1
+                tok_adj[start_marker_pos][end_marker_pos] = 1
+                tok_adj[end_marker_pos][start_marker_pos] = 1
+
         context_matrix = np.zeros(
             (self.max_seq_length + self.max_pair_length * 2, self.max_seq_length + self.max_pair_length * 2)).astype('float64')
         context_matrix[1:truncate_tok_len + 1, 1:truncate_tok_len + 1] = tok_adj
         # context_matrix[truncate_tok_len + 1,truncate_tok_len + 1] = 1
         np.fill_diagonal(context_matrix, 1)
+
+        total_input_len = self.max_seq_length + self.max_pair_length * 2
+        lex_ids = [2] * total_input_len
+        if self.use_lexicon and entry.get('lex_features') is not None:
+            lex_feats = entry['lex_features']
+            for i in range(min(truncate_tok_len, self.max_seq_length - 2)):
+                ori_idx = tok2ori_map_t[i]
+                if ori_idx != -1 and ori_idx < len(lex_feats):
+                    lex_ids[i + 1] = lex_feats[ori_idx]
         #===========================
         sub, sub_position, sub_label = entry['sub']
         input_ids = self.tokenizer.convert_tokens_to_ids(entry['sentence'])
@@ -631,6 +664,7 @@ class ACEDataset(Dataset):
                 torch.tensor(context_matrix),
                 sub_width_embeddings.detach(),
                 obj_width_embeddings.detach(),
+                torch.tensor(lex_ids, dtype=torch.int64),
                 entry['whole_sen'],
                 t,
         ]
@@ -808,6 +842,8 @@ def train(args, model, tokenizer,dataset_list,dev_list):
                       'sub_width_embedding': batch[9],
                       'obj_width_embedding': batch[10],
                       }
+            if getattr(args, 'use_lexicon', False):
+                inputs['lex_ids'] = batch[11]
 
 
             inputs['sub_positions'] = batch[3]
@@ -955,7 +991,7 @@ def evaluate(args,dataset_list,model, tokenizer, prefix="", do_test=False):
         ner_labels = batch[6]
         SEN = batch[-5]#整个句子
         sen_word = batch[-4]#单个单词
-        batch = tuple(t.to(args.device) for t in batch[:11])
+        batch = tuple(t.to(args.device) for t in batch[:12])
 
         with torch.no_grad():
             inputs = {'input_ids':      batch[0],
@@ -967,6 +1003,8 @@ def evaluate(args,dataset_list,model, tokenizer, prefix="", do_test=False):
                     'sub_width_embedding':batch[9],
                     'obj_width_embedding':batch[10],
                     }
+            if getattr(args, 'use_lexicon', False):
+                inputs['lex_ids'] = batch[11]
 
             inputs['sub_positions'] = batch[3]
             if args.model_type.find('span')!=-1:
@@ -1516,6 +1554,14 @@ def main():
     parser.add_argument('--beta', type=float, default=1.0,
                         help='')
     parser.add_argument('--focalloss', action='store_true',
+                        help='')
+    parser.add_argument('--align_markers', action='store_true',
+                        help='')
+    parser.add_argument('--use_lexicon', action='store_true',
+                        help='')
+    parser.add_argument('--lexicon_dir', type=str, default='lexicon',
+                        help='')
+    parser.add_argument('--lex_emb_dim', type=int, default=32,
                         help='')
     args = parser.parse_args()
     args.highway = False
