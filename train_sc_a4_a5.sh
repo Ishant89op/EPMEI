@@ -9,7 +9,7 @@ CUDA_VISIBLE_DEVICES=$GPU_ID python3 run_sc.py --model_type bertsub \
     --max_seq_length 256 --max_pair_length 16 --save_steps 50 \
     --do_train --do_eval --evaluate_during_training --eval_all_checkpoints --eval_logsoftmax \
     --seed $seed \
-    --test_file ../EPMEI_reproduction/ner/$dataset/ent_pred_test_pro.json \
+    --test_file data/ner_predictions/$dataset/ent_pred_test_pro.json \
     --use_ner_results \
     --use_typemarker --gcn --n_gcn 2 \
     --align_markers \
