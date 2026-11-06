@@ -520,8 +520,6 @@ class ACEDataset(Dataset):
                 if span_last >= 0 and tok2ori_map_t[span_last] != -1:
                     tok_adj[end_marker_pos][span_last] = 1
                     tok_adj[span_last][end_marker_pos] = 1
-                tok_adj[start_marker_pos][end_marker_pos] = 1
-                tok_adj[end_marker_pos][start_marker_pos] = 1
 
         context_matrix = np.zeros(
             (self.max_seq_length + self.max_pair_length * 2, self.max_seq_length + self.max_pair_length * 2)).astype('float64')
@@ -530,7 +528,7 @@ class ACEDataset(Dataset):
         np.fill_diagonal(context_matrix, 1)
 
         total_input_len = self.max_seq_length + self.max_pair_length * 2
-        lex_ids = [2] * total_input_len
+        lex_ids = [0] * total_input_len
         if self.use_lexicon and entry.get('lex_features') is not None:
             lex_feats = entry['lex_features']
             for i in range(min(truncate_tok_len, self.max_seq_length - 2)):
@@ -580,6 +578,16 @@ class ACEDataset(Dataset):
                 for yy in [w1, w2]:
                     attention_mask[xx, yy] = 1  #marker 可以互相看到
                 attention_mask[xx, :L] = 1  # marker 可以看到句子
+
+            if getattr(self.args, 'align_markers', False):
+                obj_start = m2[0]
+                obj_end = m2[1]
+                if 0 < obj_start < self.max_seq_length:
+                    context_matrix[w1, obj_start] = 1
+                    context_matrix[obj_start, w1] = 1
+                if 0 < obj_end < self.max_seq_length:
+                    context_matrix[w2, obj_end] = 1
+                    context_matrix[obj_end, w2] = 1
 
             labels.append(label)
             ner_labels.append(m2[2])

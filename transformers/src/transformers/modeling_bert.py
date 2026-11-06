@@ -2388,14 +2388,13 @@ class BertForACEBothOneDropoutSub(BertPreTrainedModel):
         self.use_lexicon = getattr(args, 'use_lexicon', False)
         if self.use_lexicon:
             lex_dim = getattr(args, 'lex_emb_dim', 32)
-            self.lex_emb = nn.Embedding(6, lex_dim)
-            self.lex_proj = nn.Linear(lex_dim, config.hidden_size)
+            self.lex_emb = nn.Embedding(5, lex_dim, padding_idx=0)
+            self.lex_proj = nn.Linear(lex_dim, config.hidden_size, bias=False)
 
         self.init_weights()
 
         if self.use_lexicon:
             nn.init.zeros_(self.lex_proj.weight)
-            nn.init.zeros_(self.lex_proj.bias)
 
         self.norm_gcn = nn.LayerNorm(args.embedding_dim).double()
 
@@ -2435,8 +2434,9 @@ class BertForACEBothOneDropoutSub(BertPreTrainedModel):
         pool_out = outputs[1]
 
         if self.use_lexicon and lex_ids is not None:
+            mask = (lex_ids != 0).unsqueeze(-1).to(hidden_states.dtype)
             lex_repr = self.lex_proj(self.lex_emb(lex_ids))
-            hidden_states = hidden_states + lex_repr
+            hidden_states = hidden_states + mask * lex_repr
 
         if self.args.gcn:
             dep_sparse_out_previous = hidden_states
