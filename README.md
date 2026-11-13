@@ -4,7 +4,7 @@ This repository is an implementation of our paper "Enhanced Packed Marker with E
 You Li, Xupeng Zeng, Yixiao Zeng, and Yuming Lin. 2024. Enhanced Packed Marker with Entity Information for Aspect Sentiment Triplet Extraction. In Proceedings of the 47th International ACM SIGIR Conference on Research and Development in Information Retrieval (SIGIR'24), July 14–18, 2024, Washington, DC, USA. ACM, New York, NY, USA, 11 pages. https://doi.org/10.1145/3626772.3657734
 
 
-Create the bert folder bert_models/bert-base-uncased  from https://huggingface.co/google-bert/bert-base-uncased/tree/main
+Create the bert folder  bert_models/bert-base-uncased  from https://huggingface.co/google-bert/bert-base-uncased/tree/main
 
 create result/ner/14lap
 
