@@ -2256,6 +2256,70 @@ class GCN(nn.Module):
             return output
 
 
+class EnhancedGCN(nn.Module):
+    """
+    Enhanced GCN layer (A5-v3): Xavier initialization + GELU activation.
+    """
+
+    def __init__(self, in_features, out_features, bias=True):
+        super(EnhancedGCN, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.empty(in_features, out_features).double())
+        nn.init.xavier_uniform_(self.weight)
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features).double())
+        else:
+            self.register_parameter('bias', None)
+        self.act = nn.GELU()
+
+    def forward(self, text, adj):
+        text = text.double()
+        hidden = torch.matmul(text, self.weight)
+        denom = torch.sum(adj, dim=2, keepdim=True) + 1
+        output = torch.matmul(adj, hidden) / denom
+        if self.bias is not None:
+            if self.bias.dtype != output.dtype:
+                self.bias = nn.Parameter(self.bias.to(output.dtype))
+            output = output + self.bias
+        output = self.act(output)
+        return output
+
+
+class SpanPairScorer(nn.Module):
+    """
+    Span-Pair Interactive Scorer (A4-v3): replaces additive m1+m2 scoring
+    with MLP over [m1; m2; m1*m2] for richer cross-span interaction.
+    """
+
+    def __init__(self, span_dim, num_labels, hidden_dim=256, dropout=0.2):
+        super(SpanPairScorer, self).__init__()
+        # Input: concat(m1, m2, m1*m2) = 3 * span_dim
+        self.scorer = nn.Sequential(
+            nn.Linear(span_dim * 3, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_labels),
+        )
+        # Initialize final layer near zero so initial predictions stay close to baseline
+        nn.init.xavier_uniform_(self.scorer[0].weight, gain=0.5)
+        nn.init.zeros_(self.scorer[0].bias)
+        nn.init.xavier_uniform_(self.scorer[3].weight, gain=0.1)
+        nn.init.zeros_(self.scorer[3].bias)
+
+    def forward(self, m1_states, m2_states):
+        """
+        m1_states: [bsz, span_dim]
+        m2_states: [bsz, ent_len, span_dim]
+        Returns: [bsz, ent_len, num_labels]
+        """
+        ent_len = m2_states.size(1)
+        m1_expanded = m1_states.unsqueeze(1).expand(-1, ent_len, -1)  # [bsz, ent_len, span_dim]
+        interaction = m1_expanded * m2_states  # element-wise product
+        pair_repr = torch.cat([m1_expanded, m2_states, interaction], dim=-1)  # [bsz, ent_len, 3*span_dim]
+        return self.scorer(pair_repr)  # [bsz, ent_len, num_labels]
+
+
 
 
 
@@ -2374,15 +2438,29 @@ class BertForACEBothOneDropoutSub(BertPreTrainedModel):
         # self.gcn = GCN()
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-        if self.args.use_span_width:
+        self.use_pair_scorer = getattr(args, 'use_pair_scorer', False)
+        self.use_enhanced_gcn = getattr(args, 'use_enhanced_gcn', False)
 
-            self.ner_classifier = nn.Linear(config.hidden_size * 2+self.args.span_width_embedding_dim, self.num_ner_labels)
-            self.re_classifier_m1 = nn.Linear(config.hidden_size * 2+self.args.span_width_embedding_dim, self.num_labels).float()
-            self.re_classifier_m2 = nn.Linear(config.hidden_size * 2+self.args.span_width_embedding_dim, self.num_labels).float()
+        if self.args.use_span_width:
+            span_dim = config.hidden_size * 2 + self.args.span_width_embedding_dim
+            self.ner_classifier = nn.Linear(span_dim, self.num_ner_labels)
+            if self.use_pair_scorer:
+                self.pair_scorer = SpanPairScorer(span_dim, self.num_labels,
+                                                  hidden_dim=getattr(args, 'pair_hidden_dim', 256),
+                                                  dropout=getattr(args, 'pair_dropout', 0.2)).float()
+            else:
+                self.re_classifier_m1 = nn.Linear(span_dim, self.num_labels).float()
+                self.re_classifier_m2 = nn.Linear(span_dim, self.num_labels).float()
         else:
-            self.ner_classifier = nn.Linear(config.hidden_size * 2,self.num_ner_labels)
-            self.re_classifier_m1 = nn.Linear(config.hidden_size * 2,self.num_labels).float()
-            self.re_classifier_m2 = nn.Linear(config.hidden_size * 2,self.num_labels).float()
+            span_dim = config.hidden_size * 2
+            self.ner_classifier = nn.Linear(span_dim, self.num_ner_labels)
+            if self.use_pair_scorer:
+                self.pair_scorer = SpanPairScorer(span_dim, self.num_labels,
+                                                  hidden_dim=getattr(args, 'pair_hidden_dim', 256),
+                                                  dropout=getattr(args, 'pair_dropout', 0.2)).float()
+            else:
+                self.re_classifier_m1 = nn.Linear(span_dim, self.num_labels).float()
+                self.re_classifier_m2 = nn.Linear(span_dim, self.num_labels).float()
         self.alpha = torch.tensor([config.alpha] + [1.0] * (self.num_labels - 1), dtype=torch.float32)
 
         self.use_lexicon = getattr(args, 'use_lexicon', False)
@@ -2399,8 +2477,15 @@ class BertForACEBothOneDropoutSub(BertPreTrainedModel):
 
         self.norm_gcn = nn.LayerNorm(args.embedding_dim).double()
 
-        self.gcn = nn.ModuleList(
-            [GCN(args.embedding_dim, args.embedding_dim).to(args.device) for i in range(args.n_gcn)])
+        # --- A5-v3: Enhanced GCN with Xavier init, GELU, and learnable residual gate ---
+        if self.use_enhanced_gcn:
+            self.gcn = nn.ModuleList(
+                [EnhancedGCN(args.embedding_dim, args.embedding_dim).to(args.device) for i in range(args.n_gcn)])
+            # Learnable residual scale (initialized small so GCN output blends in gently)
+            self.gcn_res_scale = nn.Parameter(torch.tensor([0.1] * args.n_gcn, dtype=torch.float64))
+        else:
+            self.gcn = nn.ModuleList(
+                [GCN(args.embedding_dim, args.embedding_dim).to(args.device) for i in range(args.n_gcn)])
 
 
 
@@ -2440,13 +2525,22 @@ class BertForACEBothOneDropoutSub(BertPreTrainedModel):
 
         if self.args.gcn:
             dep_sparse_out_previous = hidden_states
-            for i in range(self.args.n_gcn):
-                dep_sparse_out = self.gcn[i](dep_sparse_out_previous, adj)
-                norm_input = dep_sparse_out_previous + dep_sparse_out
-                norm_input = norm_input.double()
-                dep_sparse_out = self.norm_gcn(norm_input)
-                # dep_sparse_out = dep_sparse_out_previous + dep_sparse_out
-                dep_sparse_out_previous = dep_sparse_out
+            if self.use_enhanced_gcn:
+                # A5-v3: Enhanced GCN with learnable residual scaling
+                for i in range(self.args.n_gcn):
+                    dep_sparse_out = self.gcn[i](dep_sparse_out_previous, adj)
+                    scale = self.gcn_res_scale[i].to(dep_sparse_out.dtype)
+                    norm_input = dep_sparse_out_previous.double() + scale * dep_sparse_out
+                    dep_sparse_out = self.norm_gcn(norm_input)
+                    dep_sparse_out_previous = dep_sparse_out
+            else:
+                for i in range(self.args.n_gcn):
+                    dep_sparse_out = self.gcn[i](dep_sparse_out_previous, adj)
+                    norm_input = dep_sparse_out_previous + dep_sparse_out
+                    norm_input = norm_input.double()
+                    dep_sparse_out = self.norm_gcn(norm_input)
+                    # dep_sparse_out = dep_sparse_out_previous + dep_sparse_out
+                    dep_sparse_out_previous = dep_sparse_out
             hidden_states = dep_sparse_out
 
         hidden_states = self.dropout(hidden_states)
@@ -2480,10 +2574,13 @@ class BertForACEBothOneDropoutSub(BertPreTrainedModel):
 
 
         m1_states = m1_states.float()
-        m1_scores = self.re_classifier_m1(m1_states)  # bsz, num_label  #主语在7个label(NIL,POS,NEU,NEG,对应的对称)上的分数
-        m2_scores = self.re_classifier_m2(feature_vector)  # bsz, ent_len, num_label  #obj在 7个label上的分数
-        re_prediction_scores = m1_scores.unsqueeze(1) + self.args.beta*m2_scores  # 每个 obj 的score 都加上了 sub的score
-        # 我认为 opinion的词 在 对于情感的方面的预测的 重要程度应该大于 aspect 这里需不需要一个加权，但是由于 是sub-oriented, 后面还是会有以 opinion作为sub的时候
+        # --- A4-v3: Span-Pair Interactive Scorer ---
+        if self.use_pair_scorer:
+            re_prediction_scores = self.pair_scorer(m1_states, feature_vector)
+        else:
+            m1_scores = self.re_classifier_m1(m1_states)  # bsz, num_label
+            m2_scores = self.re_classifier_m2(feature_vector)  # bsz, ent_len, num_label
+            re_prediction_scores = m1_scores.unsqueeze(1) + self.args.beta*m2_scores
 
         outputs = (re_prediction_scores, ner_prediction_scores) + outputs[
                                                                   2:]  # outputs[2:]是空的 # Add hidden states and attention if they are here

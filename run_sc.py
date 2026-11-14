@@ -1563,6 +1563,14 @@ def main():
                         help='')
     parser.add_argument('--lex_emb_dim', type=int, default=32,
                         help='')
+    parser.add_argument('--use_pair_scorer', action='store_true',
+                        help='A4-v3: Replace additive m1+m2 scoring with Span-Pair Interactive Scorer MLP')
+    parser.add_argument('--pair_hidden_dim', type=int, default=256,
+                        help='Hidden dimension for span-pair scorer MLP')
+    parser.add_argument('--pair_dropout', type=float, default=0.2,
+                        help='Dropout rate in span-pair scorer MLP')
+    parser.add_argument('--use_enhanced_gcn', action='store_true',
+                        help='A5-v3: Use Enhanced GCN with Xavier init, GELU, and learnable residual scale')
     args = parser.parse_args()
     args.highway = False
     wandb.login()
