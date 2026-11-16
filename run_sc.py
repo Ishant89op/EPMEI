@@ -768,10 +768,29 @@ def train(args, model, tokenizer,dataset_list,dev_list):
 
     # Prepare optimizer and schedule (linear warmup and decay)
     no_decay = ['bias', 'LayerNorm.weight']
+    # v4: differential LR for newly initialized params (pair_scorer, gcn_res_scale)
+    new_param_keywords = ['pair_scorer', 'gcn_res_scale']
+    new_lr = args.new_param_lr if args.new_param_lr > 0 else args.learning_rate
+
+    def is_new_param(name):
+        return any(kw in name for kw in new_param_keywords)
+
     optimizer_grouped_parameters = [
-        {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay},
-        {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
-        ]
+        # BERT / existing params with decay
+        {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay) and not is_new_param(n)],
+         'weight_decay': args.weight_decay, 'lr': args.learning_rate},
+        # BERT / existing params without decay
+        {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay) and not is_new_param(n)],
+         'weight_decay': 0.0, 'lr': args.learning_rate},
+        # New params with decay (higher LR)
+        {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay) and is_new_param(n)],
+         'weight_decay': args.weight_decay, 'lr': new_lr},
+        # New params without decay (higher LR)
+        {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay) and is_new_param(n)],
+         'weight_decay': 0.0, 'lr': new_lr},
+    ]
+    # Filter out empty groups
+    optimizer_grouped_parameters = [g for g in optimizer_grouped_parameters if len(g['params']) > 0]
 
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
     if args.warmup_steps==-1:
@@ -1571,6 +1590,9 @@ def main():
                         help='Dropout rate in span-pair scorer MLP')
     parser.add_argument('--use_enhanced_gcn', action='store_true',
                         help='A5-v3: Use Enhanced GCN with Xavier init, GELU, and learnable residual scale')
+    parser.add_argument('--new_param_lr', type=float, default=0.0,
+                        help='Learning rate for newly initialized params (pair_scorer, gcn_res_scale). '
+                             '0 = use same as --learning_rate (default).')
     args = parser.parse_args()
     args.highway = False
     wandb.login()
