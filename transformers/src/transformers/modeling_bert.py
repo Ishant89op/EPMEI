@@ -2288,23 +2288,26 @@ class EnhancedGCN(nn.Module):
 
 class SpanPairScorer(nn.Module):
     """
-    Span-Pair Interactive Scorer (A4-v3): replaces additive m1+m2 scoring
-    with MLP over [m1; m2; m1*m2] for richer cross-span interaction.
+    Multi-Perspective Interactive Span-Pair Scorer (A4-v5):
+    Concatenates [m1, m2, |m1 - m2|, m1 * m2] (4 * span_dim)
+    for bidirectional semantic and geometric interaction.
+    Outputs residual adjustment scores with small initialization.
     """
 
-    def __init__(self, span_dim, num_labels, hidden_dim=256, dropout=0.2):
+    def __init__(self, span_dim, num_labels, hidden_dim=256, dropout=0.15):
         super(SpanPairScorer, self).__init__()
-        # Input: concat(m1, m2, m1*m2) = 3 * span_dim
+        # Input: concat(m1, m2, |m1 - m2|, m1 * m2) = 4 * span_dim
         self.scorer = nn.Sequential(
-            nn.Linear(span_dim * 3, hidden_dim),
+            nn.Linear(span_dim * 4, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, num_labels),
         )
-        # Initialize final layer near zero so initial predictions stay close to baseline
+        # Initialize first layer with Xavier
         nn.init.xavier_uniform_(self.scorer[0].weight, gain=0.5)
         nn.init.zeros_(self.scorer[0].bias)
-        nn.init.xavier_uniform_(self.scorer[3].weight, gain=0.1)
+        # Initialize final layer near zero so it smoothly refines the linear base
+        nn.init.xavier_uniform_(self.scorer[3].weight, gain=0.01)
         nn.init.zeros_(self.scorer[3].bias)
 
     def forward(self, m1_states, m2_states):
@@ -2315,118 +2318,86 @@ class SpanPairScorer(nn.Module):
         """
         ent_len = m2_states.size(1)
         m1_expanded = m1_states.unsqueeze(1).expand(-1, ent_len, -1)  # [bsz, ent_len, span_dim]
-        interaction = m1_expanded * m2_states  # element-wise product
-        pair_repr = torch.cat([m1_expanded, m2_states, interaction], dim=-1)  # [bsz, ent_len, 3*span_dim]
+        diff = torch.abs(m1_expanded - m2_states)  # [bsz, ent_len, span_dim]
+        interaction = m1_expanded * m2_states  # element-wise product [bsz, ent_len, span_dim]
+        pair_repr = torch.cat([m1_expanded, m2_states, diff, interaction], dim=-1)  # [bsz, ent_len, 4*span_dim]
         return self.scorer(pair_repr)  # [bsz, ent_len, num_labels]
 
 
-
-
-
 class FocalLoss(nn.Module):
-    def __init__(self, alpha=None, gamma=2, num_classes=3, size_average=True):
+    def __init__(self, alpha=None, gamma=2, num_classes=3, size_average=True, label_smoothing=0.0):
         """
-        FocalLoss损失函数, -α(1-yi)**γ *ce_loss(xi,yi)
-        步骤详细的实现了 FocalLoss损失函数.
-        :param alpha:   阿尔法α,类别权重.      当α是列表时,为各类别权重,当α为常数时,类别权重为[α, 1-α, 1-α, ....],常用于 目标检测算法中抑制背景类 , retina net中设置为0.25
-        :param gamma:   伽马γ,难易样本调节参数. retina net中设置为2
-        :param num_classes:     类别数量
-        :param size_average:    损失计算方式,默认取均值
+        FocalLoss with optional Label Smoothing.
+        :param alpha:   class weights
+        :param gamma:   focusing parameter
+        :param num_classes:     number of classes
+        :param size_average:    whether to average over batch
+        :param label_smoothing: label smoothing factor (0.0 means standard hard labels)
         """
         super(FocalLoss, self).__init__()
         self.size_average = size_average
+        self.label_smoothing = label_smoothing
         if alpha is None:
             self.alpha = torch.ones(num_classes)
         elif isinstance(alpha, list):
-            assert len(alpha) == num_classes  # α可以以list方式输入,size:[num_classes] 用于对不同类别精细地赋予权重
+            assert len(alpha) == num_classes
             self.alpha = torch.Tensor(alpha)
         else:
-            assert alpha < 1  # 如果α为一个常数,则降低第一类的影响,在目标检测中第一类为背景类
+            assert alpha < 1
             self.alpha = torch.zeros(num_classes)
-
-            # α 最终为 [ α, 1-α, 1-α, 1-α, 1-α, ...] size:[num_classes]
             self.alpha[0].fill_(alpha)
             self.alpha[1:].fill_(1 - alpha)
 
         self.gamma = gamma
 
     def forward(self, preds, labels):
-        """
-        FocalLoss损失计算
-        :param preds:   预测类别. size:[B,N,C] or [B,C]    分别对应与检测与分类任务, B 批次, N检测框数, C类别数
-        :param labels:  实际类别. size:[B,N] or [B]
-        :return:
-        """
-        # assert preds.dim()==2 and labels.dim()==1
-
-        ###############################
-        # 一、初始操作
-        ###############################
-        res = 0
-        # 按照最后一个维度重新调整矩阵形状，因为最后一个维度是分类数
         batches = preds.size(0)
+        res = 0
+        valid_batches = 0
         for batch in range(batches):
-            pred = preds[batch,:,:]
+            pred = preds[batch, :, :]
             count = len([x for x in labels[batch] if x != -1])
-            pred =  pred[:count,:]
+            if count == 0:
+                continue
+            pred = pred[:count, :]
             pred = pred.view(-1, pred.size(-1))
             alpha = self.alpha.to(pred.device)
 
-            ###############################
-            # 二、计算预测概率Pt
-            # focalLoss(pt) = -(1-pt)^γ * log(pt)
-            ###############################
+            pt = F.softmax(pred, dim=1)
+            log_pt = F.log_softmax(pred, dim=1)
 
-            # 将 preds 张量在第 1 个维度上执行 softmax 操作，过softmax之后的，就是pt
-            pt = preds_softmax = F.softmax(pred, dim=1)
-            # 交叉熵损失函数 CELoss(pt) = -log(pt)，这个pt，就是预估值，多分类是softmax后的概率值，二分类是sigmoid后的值
-            # 在softmax后面接着log，这样算交叉熵只用前面加个负号
-            log_pt = preds_logSoftmax = torch.log(pt)
+            label = labels[batch, :]
+            label = label[:count].long()
 
-            ###############################
-            # 三、选真实标签对应的数据
-            ###############################
+            if self.label_smoothing > 0.0:
+                num_classes = pred.size(-1)
+                smooth_targets = torch.full_like(pred, self.label_smoothing / num_classes)
+                smooth_targets.scatter_(1, label.view(-1, 1), 1.0 - self.label_smoothing + (self.label_smoothing / num_classes))
+                focal_weight = torch.pow(1.0 - pt, self.gamma)
+                per_class_loss = - alpha.unsqueeze(0) * focal_weight * log_pt
+                loss = (smooth_targets * per_class_loss).sum(dim=-1)
+            else:
+                labelsView = label.view(-1, 1)
+                pt_gathered = pt.gather(1, labelsView)
+                log_pt_gathered = log_pt.gather(1, labelsView)
+                loss = -torch.mul(torch.pow((1 - pt_gathered), self.gamma), log_pt_gathered)
+                alpha_gathered = alpha.gather(0, label.view(-1)).unsqueeze(1)
+                loss = torch.mul(alpha_gathered, loss)
 
-            # labels.view(-1,1) 是将 labels 张量的形状调整为 (N, 1)
-            # Ensure the labels are long, not float
-            label = labels[batch,:]
-            label = label[:count]
-            labelsView = label.view(-1, 1).long()
-            # 下面操作的目的就是选出真实标签对应的pt
-            pt = pt.gather(1, labelsView)
-            # 下面操作的目的就是选出真实标签对应的log_pt
-            log_pt = log_pt.gather(1, labelsView)
-
-            ###############################
-            # 四、不带α的focal-loss
-            ###############################
-
-            # focalLoss(pt) = -(1-pt)^γ * log(pt)
-            loss = -torch.mul(torch.pow((1 - pt), self.gamma), log_pt)
-
-            ###############################
-            # 五、带上α的focal-loss
-            ###############################
-            # labels.view(-1) 的作用是将 labels 张量的形状调整为一个一维张量
-            label_flatten = labelsView.view(-1)
-            # 因为算softmax的时候，会把所有的值的softmax都算出来，然而我们需要的只要真实标签的那些而已
-            # 所以要进行取值操作
-            # 整句话的作用就是alpha根据label值，取到每个分类对应的数值α
-            alpha = alpha.gather(0, label_flatten)
-            # 损失乘上α向量操作
-            loss = torch.mul(alpha, loss.t())
-            # 根据需求，看损失是求平均还是求和
             if self.size_average:
                 loss = loss.mean()
             else:
                 loss = loss.sum()
 
-            res += loss
+            res = res + loss
+            valid_batches += 1
+
+        if valid_batches == 0:
+            return torch.tensor(0.0, device=preds.device, requires_grad=True)
+
         if self.size_average:
-            loss = res/batches
-        else:
-            loss = res
-        return loss
+            res = res / valid_batches
+        return res
 class BertForACEBothOneDropoutSub(BertPreTrainedModel):
     def __init__(self, config, args):
         super().__init__(config)
@@ -2444,23 +2415,21 @@ class BertForACEBothOneDropoutSub(BertPreTrainedModel):
         if self.args.use_span_width:
             span_dim = config.hidden_size * 2 + self.args.span_width_embedding_dim
             self.ner_classifier = nn.Linear(span_dim, self.num_ner_labels)
+            self.re_classifier_m1 = nn.Linear(span_dim, self.num_labels).float()
+            self.re_classifier_m2 = nn.Linear(span_dim, self.num_labels).float()
             if self.use_pair_scorer:
                 self.pair_scorer = SpanPairScorer(span_dim, self.num_labels,
                                                   hidden_dim=getattr(args, 'pair_hidden_dim', 256),
-                                                  dropout=getattr(args, 'pair_dropout', 0.2)).float()
-            else:
-                self.re_classifier_m1 = nn.Linear(span_dim, self.num_labels).float()
-                self.re_classifier_m2 = nn.Linear(span_dim, self.num_labels).float()
+                                                  dropout=getattr(args, 'pair_dropout', 0.15)).float()
         else:
             span_dim = config.hidden_size * 2
             self.ner_classifier = nn.Linear(span_dim, self.num_ner_labels)
+            self.re_classifier_m1 = nn.Linear(span_dim, self.num_labels).float()
+            self.re_classifier_m2 = nn.Linear(span_dim, self.num_labels).float()
             if self.use_pair_scorer:
                 self.pair_scorer = SpanPairScorer(span_dim, self.num_labels,
                                                   hidden_dim=getattr(args, 'pair_hidden_dim', 256),
-                                                  dropout=getattr(args, 'pair_dropout', 0.2)).float()
-            else:
-                self.re_classifier_m1 = nn.Linear(span_dim, self.num_labels).float()
-                self.re_classifier_m2 = nn.Linear(span_dim, self.num_labels).float()
+                                                  dropout=getattr(args, 'pair_dropout', 0.15)).float()
         self.alpha = torch.tensor([config.alpha] + [1.0] * (self.num_labels - 1), dtype=torch.float32)
 
         self.use_lexicon = getattr(args, 'use_lexicon', False)
@@ -2574,18 +2543,22 @@ class BertForACEBothOneDropoutSub(BertPreTrainedModel):
 
 
         m1_states = m1_states.float()
-        # --- A4-v3: Span-Pair Interactive Scorer ---
+        m1_scores = self.re_classifier_m1(m1_states)  # bsz, num_label
+        m2_scores = self.re_classifier_m2(feature_vector)  # bsz, ent_len, num_label
+        base_re_scores = m1_scores.unsqueeze(1) + self.args.beta * m2_scores
+
+        # --- A4-v5: Span-Pair Interactive Scorer with Residual Fusion ---
         if self.use_pair_scorer:
-            re_prediction_scores = self.pair_scorer(m1_states, feature_vector)
+            spis_scores = self.pair_scorer(m1_states, feature_vector)
+            re_prediction_scores = base_re_scores + spis_scores
         else:
-            m1_scores = self.re_classifier_m1(m1_states)  # bsz, num_label
-            m2_scores = self.re_classifier_m2(feature_vector)  # bsz, ent_len, num_label
-            re_prediction_scores = m1_scores.unsqueeze(1) + self.args.beta*m2_scores
+            re_prediction_scores = base_re_scores
 
         outputs = (re_prediction_scores, ner_prediction_scores) + outputs[
                                                                   2:]  # outputs[2:]是空的 # Add hidden states and attention if they are here
 
         if labels is not None:
+            label_smooth = getattr(self.args, 'label_smoothing', 0.0)
             if not self.args.focalloss :
                 loss_fct_re = CrossEntropyLoss(ignore_index=-1, weight=self.alpha.to(re_prediction_scores))
                 re_loss = loss_fct_re(re_prediction_scores.view(-1, self.num_labels), labels.view(-1))
@@ -2593,16 +2566,16 @@ class BertForACEBothOneDropoutSub(BertPreTrainedModel):
                 ner_loss = loss_fct_ner(ner_prediction_scores.view(-1, self.num_ner_labels), ner_labels.view(-1))
             else:
                 if self.args.data_dir.find('14lap') != -1:
-                    loss_fn = FocalLoss(alpha=[8661/5735, 8661/1640, 8661/1034, 8661/552, 8661/1640,8661/1034,8661/552], gamma=2, num_classes=7)
+                    loss_fn = FocalLoss(alpha=[8661/5735, 8661/1640, 8661/1034, 8661/552, 8661/1640,8661/1034,8661/552], gamma=2, num_classes=7, label_smoothing=label_smooth)
                 elif self.args.data_dir.find('14res') != -1:
-                    loss_fn = FocalLoss(alpha=[16807/12131, 16807/3382, 16807/962, 16807/632, 16807/3382, 16807/962, 16807/632], gamma=2, num_classes=7)
+                    loss_fn = FocalLoss(alpha=[16807/12131, 16807/3382, 16807/962, 16807/632, 16807/3382, 16807/962, 16807/632], gamma=2, num_classes=7, label_smoothing=label_smooth)
                 elif self.args.data_dir.find('15res') != -1:
-                    loss_fn = FocalLoss(alpha=[6553/4527,6553/1566, 6553/410, 6553/350,6553/1566, 6553/410, 6553/350], gamma=2, num_classes=7)
+                    loss_fn = FocalLoss(alpha=[6553/4527,6553/1566, 6553/410, 6553/350,6553/1566, 6553/410, 6553/350], gamma=2, num_classes=7, label_smoothing=label_smooth)
                 elif self.args.data_dir.find('16res') != -1:
-                    loss_fn = FocalLoss(alpha=[8995/6207, 8995/2030, 8995/658, 8995/100, 8995/2030, 8995/658, 8995/100], gamma=2, num_classes=7)
+                    loss_fn = FocalLoss(alpha=[8995/6207, 8995/2030, 8995/658, 8995/100, 8995/2030, 8995/658, 8995/100], gamma=2, num_classes=7, label_smoothing=label_smooth)
 
                 re_loss = loss_fn(re_prediction_scores, labels)
-                loss_fct_ner = FocalLoss(alpha=0.2, gamma=2, num_classes=3)
+                loss_fct_ner = FocalLoss(alpha=0.2, gamma=2, num_classes=3, label_smoothing=label_smooth)
                 ner_loss = loss_fct_ner(ner_prediction_scores, ner_labels)
 
             loss = re_loss + ner_loss

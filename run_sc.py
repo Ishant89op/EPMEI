@@ -31,6 +31,7 @@ import wandb
 import numpy as np
 from copy import copy, deepcopy
 import torch
+import torch.nn.functional as F
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
                               TensorDataset)
 from torch.utils.data.distributed import DistributedSampler
@@ -870,10 +871,35 @@ def train(args, model, tokenizer,dataset_list,dev_list):
                 inputs['mention_pos'] = batch[4]
             if args.model_type.endswith('bertonedropoutnersub'):
                 inputs['sub_ner_labels'] = batch[7]
-            outputs = model(**inputs)
-            loss = outputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
-            re_loss = outputs[1]
-            ner_loss = outputs[2]
+            if getattr(args, 'rdrop_alpha', 0.0) > 0.0:
+                outputs1 = model(**inputs)
+                outputs2 = model(**inputs)
+                loss1, loss2 = outputs1[0], outputs2[0]
+
+                # R-Drop: symmetric KL divergence on relation prediction logits
+                re_logits1 = outputs1[3]  # [bsz, ent_len, num_labels]
+                re_logits2 = outputs2[3]  # [bsz, ent_len, num_labels]
+                labels = inputs['labels']  # [bsz, ent_len]
+                mask = (labels != -1)
+
+                if mask.sum() > 0:
+                    p1 = F.log_softmax(re_logits1[mask], dim=-1)
+                    p2 = F.log_softmax(re_logits2[mask], dim=-1)
+                    q1 = F.softmax(re_logits1[mask], dim=-1)
+                    q2 = F.softmax(re_logits2[mask], dim=-1)
+                    kl_loss = 0.5 * (F.kl_div(p1, q2, reduction='batchmean') +
+                                     F.kl_div(p2, q1, reduction='batchmean'))
+                else:
+                    kl_loss = torch.tensor(0.0, device=args.device)
+
+                loss = 0.5 * (loss1 + loss2) + args.rdrop_alpha * kl_loss
+                re_loss = 0.5 * (outputs1[1] + outputs2[1])
+                ner_loss = 0.5 * (outputs1[2] + outputs2[2])
+            else:
+                outputs = model(**inputs)
+                loss = outputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
+                re_loss = outputs[1]
+                ner_loss = outputs[2]
 
             if args.n_gpu > 1:
                 loss = loss.mean() # mean() to average on multi-gpu parallel training
@@ -1593,6 +1619,10 @@ def main():
     parser.add_argument('--new_param_lr', type=float, default=0.0,
                         help='Learning rate for newly initialized params (pair_scorer, gcn_res_scale). '
                              '0 = use same as --learning_rate (default).')
+    parser.add_argument('--rdrop_alpha', type=float, default=0.0,
+                        help='A4-v5: Weight for R-Drop symmetric KL consistency regularization')
+    parser.add_argument('--label_smoothing', type=float, default=0.0,
+                        help='A4-v5: Label smoothing factor for loss calculation')
     args = parser.parse_args()
     args.highway = False
     wandb.login()
@@ -1804,6 +1834,8 @@ def main():
             checkpoints = list(os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + '/**/' + WEIGHTS_NAME, recursive=True)))
 
         logger.info("Evaluate the following checkpoints: %s", checkpoints)
+        best_eval_f1 = -1.0
+        best_pred_content = None
         for checkpoint in checkpoints:
             global_step = checkpoint.split('-')[-1] if len(checkpoints) > 1 else ""
 
@@ -1811,9 +1843,22 @@ def main():
 
             model.to(args.device)
             result = evaluate(args, test_,model, tokenizer, prefix=global_step, do_test=not args.no_test)
+            cur_f1 = result.get('f1_with_ner', 0.0)
+            if cur_f1 > best_eval_f1:
+                best_eval_f1 = cur_f1
+                pred_path = os.path.join(args.output_dir, 'pred_results.json')
+                if os.path.exists(pred_path):
+                    with open(pred_path) as pf:
+                        best_pred_content = json.load(pf)
             result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
             results.update(result)
         print (results)
+
+        # Restore pred_results.json from the best checkpoint
+        if best_pred_content is not None:
+            with open(os.path.join(args.output_dir, 'pred_results.json'), 'w') as pf:
+                json.dump(best_pred_content, pf)
+            logger.info("Saved pred_results.json corresponding to best checkpoint (F1: %.4f)", best_eval_f1)
 
         if args.no_test:  # choose best resutls on dev set
             bestv = 0
